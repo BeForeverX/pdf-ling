@@ -7,17 +7,17 @@ const { PDFDocument, rgb, StandardFonts } = PDFLib;
 
 // ===== State =====
 const state = {
-  pdfBytes: null,        // original file bytes
-  pdfDoc: null,          // pdf.js doc for rendering
-  pdfLibDoc: null,       // pdf-lib doc for editing
+  pdfBytes: null,
+  pdfDoc: null,
+  pdfLibDoc: null,
   currentPage: 1,
   totalPages: 0,
   scale: 1.5,
-  tool: 'select',        // select | text | draw | highlight | erase
-  annotations: {},       // { pageNum: [{type, data}] }
+  tool: 'select',
+  annotations: {},
   undoStack: [],
   redoStack: [],
-  drawPaths: [],         // current drawing session
+  drawPaths: [],
   isDrawing: false,
   fontSize: 16,
   fontColor: '#000000',
@@ -63,15 +63,12 @@ async function handleFile(file) {
   $('fileName').textContent = file.name;
   state.pdfBytes = await file.arrayBuffer();
 
-  // Load with pdf.js for rendering
   state.pdfDoc = await pdfjsLib.getDocument({ data: state.pdfBytes.slice(0) }).promise;
   state.totalPages = state.pdfDoc.numPages;
   state.currentPage = 1;
 
-  // Load with pdf-lib for editing
   state.pdfLibDoc = await PDFDocument.load(state.pdfBytes);
 
-  // Init annotations
   state.annotations = {};
   state.undoStack = [];
   state.redoStack = [];
@@ -104,25 +101,37 @@ async function renderPage(num) {
 
   await page.render({ canvasContext: pdfCtx, viewport }).promise;
 
-  // Re-draw annotations for this page
   olCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
   redrawAnnotations(num);
 
   pageInfo.textContent = `${num} / ${state.totalPages}`;
 
-  // Highlight active thumbnail
   document.querySelectorAll('.thumb-item').forEach((el, i) => {
     el.classList.toggle('active', i + 1 === num);
   });
 }
 
+// [FIX #1] 重绘时也要画 text 标注
 function redrawAnnotations(pageNum) {
   const annots = state.annotations[pageNum] || [];
   for (const a of annots) {
     if (a.type === 'draw' || a.type === 'highlight') {
-      drawPath(olCtx, a.data);
+      drawPathOnCtx(olCtx, a.data);
+    } else if (a.type === 'text') {
+      drawTextOnCtx(olCtx, a.data);
     }
   }
+}
+
+function drawTextOnCtx(ctx, data) {
+  const canvasFontSize = data.fontSize * state.scale;
+  ctx.font = `${canvasFontSize}px sans-serif`;
+  ctx.fillStyle = data.color;
+  ctx.textBaseline = 'top';
+  const lines = data.text.split('\n');
+  lines.forEach((line, i) => {
+    ctx.fillText(line, data.x, data.y + i * canvasFontSize * 1.2);
+  });
 }
 
 // ===== Thumbnails =====
@@ -146,7 +155,6 @@ async function renderThumbnails() {
     label.textContent = i;
     item.appendChild(label);
 
-    // Page actions
     const actions = document.createElement('div');
     actions.className = 'thumb-actions';
     actions.innerHTML = `
@@ -155,14 +163,12 @@ async function renderThumbnails() {
     `;
     item.appendChild(actions);
 
-    // Click to navigate
     item.addEventListener('click', (e) => {
       if (e.target.closest('.thumb-act')) return;
       state.currentPage = i;
       renderPage(i);
     });
 
-    // Rotate / delete
     actions.querySelector('[data-action="rotate"]').addEventListener('click', () => rotatePage(i));
     actions.querySelector('[data-action="delete"]').addEventListener('click', () => deletePage(i));
 
@@ -174,10 +180,8 @@ async function renderThumbnails() {
 async function rotatePage(pageNum) {
   pushUndo();
   const page = state.pdfLibDoc.getPage(pageNum - 1);
-  const { width, height } = page.getSize();
   page.setRotation((page.getRotation().angle + 90) % 360);
 
-  // Reload pdf.js doc
   const newBytes = await state.pdfLibDoc.save();
   state.pdfBytes = newBytes;
   state.pdfDoc = await pdfjsLib.getDocument({ data: newBytes.slice(0) }).promise;
@@ -192,7 +196,6 @@ async function deletePage(pageNum) {
   state.pdfLibDoc.removePage(pageNum - 1);
   state.totalPages = state.pdfLibDoc.getPageCount();
 
-  // Migrate annotations
   const newAnnots = {};
   for (const [k, v] of Object.entries(state.annotations)) {
     const n = parseInt(k);
@@ -221,7 +224,6 @@ function setupTools() {
       textOptions.classList.toggle('hidden', state.tool !== 'text');
       drawOptions.classList.toggle('hidden', state.tool !== 'draw' && state.tool !== 'highlight' && state.tool !== 'erase');
 
-      // Cursor
       overlayCanvas.style.cursor =
         state.tool === 'select' ? 'default' :
         state.tool === 'text' ? 'text' :
@@ -235,6 +237,7 @@ function setupDrawing() {
   overlayCanvas.addEventListener('pointerdown', onPointerDown);
   overlayCanvas.addEventListener('pointermove', onPointerMove);
   overlayCanvas.addEventListener('pointerup', onPointerUp);
+  overlayCanvas.addEventListener('pointerleave', onPointerUp);
 }
 
 function getCanvasPos(e) {
@@ -260,18 +263,22 @@ function onPointerDown(e) {
 
   if (state.tool === 'draw' || state.tool === 'highlight') {
     state.isDrawing = true;
-    state.drawPaths = [{
+    const firstPt = {
       x: pos.x,
       y: pos.y,
       color: state.tool === 'highlight' ? 'rgba(255,255,0,0.3)' : state.brushColor,
       size: state.tool === 'highlight' ? 16 : state.brushSize,
-    }];
+    };
+    state.drawPaths = [firstPt];
+
+    // [FIX #4] 正确初始化画笔路径
     olCtx.beginPath();
     olCtx.moveTo(pos.x, pos.y);
-    olCtx.strokeStyle = state.drawPaths[0].color;
-    olCtx.lineWidth = state.drawPaths[0].size;
+    olCtx.strokeStyle = firstPt.color;
+    olCtx.lineWidth = firstPt.size;
     olCtx.lineCap = 'round';
     olCtx.lineJoin = 'round';
+    olCtx.globalCompositeOperation = state.tool === 'highlight' ? 'multiply' : 'source-over';
   }
 }
 
@@ -279,14 +286,28 @@ function onPointerMove(e) {
   if (!state.isDrawing) return;
   const pos = getCanvasPos(e);
   state.drawPaths.push(pos);
-  olCtx.lineTo(pos.x, pos.y);
+
+  // [FIX #4] 每次 move 重画完整路径，避免重复 stroke 导致越来越粗
+  olCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+  redrawAnnotations(state.currentPage);
+
+  olCtx.beginPath();
+  olCtx.strokeStyle = state.drawPaths[0].color;
+  olCtx.lineWidth = state.drawPaths[0].size;
+  olCtx.lineCap = 'round';
+  olCtx.lineJoin = 'round';
+  olCtx.globalCompositeOperation = state.tool === 'highlight' ? 'multiply' : 'source-over';
+  olCtx.moveTo(state.drawPaths[0].x, state.drawPaths[0].y);
+  for (let i = 1; i < state.drawPaths.length; i++) {
+    olCtx.lineTo(state.drawPaths[i].x, state.drawPaths[i].y);
+  }
   olCtx.stroke();
 }
 
 function onPointerUp() {
   if (!state.isDrawing) return;
   state.isDrawing = false;
-  olCtx.closePath();
+  olCtx.globalCompositeOperation = 'source-over';
 
   if (state.drawPaths.length > 1) {
     pushUndo();
@@ -302,21 +323,23 @@ function onPointerUp() {
     });
   }
   state.drawPaths = [];
+  // Clean redraw
+  renderPage(state.currentPage);
 }
 
-function drawPath(ctx, data) {
+function drawPathOnCtx(ctx, data) {
+  const pts = data.points;
+  if (pts.length < 2) return;
   ctx.beginPath();
   ctx.strokeStyle = data.color;
   ctx.lineWidth = data.size;
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
-  const pts = data.points;
   ctx.moveTo(pts[0].x, pts[0].y);
   for (let i = 1; i < pts.length; i++) {
     ctx.lineTo(pts[i].x, pts[i].y);
   }
   ctx.stroke();
-  ctx.closePath();
 }
 
 function eraseAt(pos) {
@@ -336,8 +359,9 @@ function eraseAt(pos) {
       }
     }
     if (a.type === 'text') {
+      const canvasFontSize = a.data.fontSize * state.scale;
       const dx = a.data.x - pos.x, dy = a.data.y - pos.y;
-      if (Math.abs(dx) < 60 && Math.abs(dy) < 20) {
+      if (Math.abs(dx) < 100 && Math.abs(dy) < canvasFontSize) {
         pushUndo();
         annots.splice(i, 1);
         renderPage(state.currentPage);
@@ -361,21 +385,28 @@ function createTextInput(pos) {
   input.className = 'text-input-overlay';
   input.style.left = (pos.x * scaleX) + 'px';
   input.style.top = (pos.y * scaleY) + 'px';
-  input.style.fontSize = state.fontSize + 'px';
+  input.style.fontSize = (state.fontSize * state.scale * scaleY / state.scale) + 'px';
   input.style.color = state.fontColor;
   input.rows = 1;
   container.appendChild(input);
   input.focus();
 
-  input.addEventListener('blur', () => commitText(input, pos));
+  let cancelled = false;
+
+  // [FIX #7] Escape 时设标记，blur 时检查
   input.addEventListener('keydown', e => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       input.blur();
     }
     if (e.key === 'Escape') {
+      cancelled = true;
       input.remove();
     }
+  });
+
+  input.addEventListener('blur', () => {
+    if (!cancelled) commitText(input, pos);
   });
 }
 
@@ -398,15 +429,8 @@ function commitText(input, pos) {
     },
   });
 
-  // Draw text on overlay for preview
-  olCtx.font = `${state.fontSize * state.scale}px sans-serif`;
-  olCtx.fillStyle = state.fontColor;
-  olCtx.textBaseline = 'top';
-  // Simple line support
-  const lines = text.split('\n');
-  lines.forEach((line, i) => {
-    olCtx.fillText(line, pos.x, pos.y + i * state.fontSize * state.scale * 1.2);
-  });
+  // Redraw everything including the new text
+  renderPage(state.currentPage);
 }
 
 // ===== Merge =====
@@ -449,6 +473,7 @@ function parsePageNumbers(input, max) {
     const trimmed = part.trim();
     if (trimmed.includes('-')) {
       const [a, b] = trimmed.split('-').map(Number);
+      if (isNaN(a) || isNaN(b)) continue;
       for (let i = Math.max(1, a); i <= Math.min(max, b); i++) nums.add(i);
     } else {
       const n = parseInt(trimmed);
@@ -461,7 +486,7 @@ function parsePageNumbers(input, max) {
 async function doSplit() {
   const input = $('splitPages').value;
   const pages = parsePageNumbers(input, state.totalPages);
-  if (!pages.length) return;
+  if (!pages.length) return alert('请输入有效页码');
 
   const newDoc = await PDFDocument.create();
   const copiedPages = await state.pdfLibDoc.copyPages(
@@ -476,18 +501,21 @@ async function doSplit() {
 }
 
 // ===== Export =====
+// [FIX #3] 导出时 clone 文档，不修改原文档；导出后清除 annotations
 async function exportPDF() {
-  pushUndo();
+  if (!state.pdfLibDoc) return;
 
-  // Bake annotations into pdf-lib document
-  const font = await state.pdfLibDoc.embedFont(StandardFonts.Helvetica);
-  const page = state.pdfLibDoc.getPage(state.currentPage - 1);
-  const { width, height } = page.getSize();
+  // Clone doc so we don't mutate the working copy
+  const savedBytes = await state.pdfLibDoc.save();
+  const exportDoc = await PDFDocument.load(savedBytes);
 
+  const font = await exportDoc.embedFont(StandardFonts.Helvetica);
   const renderScale = state.scale;
 
   for (const [pageNum, annots] of Object.entries(state.annotations)) {
-    const pg = state.pdfLibDoc.getPage(parseInt(pageNum) - 1);
+    const pgIdx = parseInt(pageNum) - 1;
+    if (pgIdx < 0 || pgIdx >= exportDoc.getPageCount()) continue;
+    const pg = exportDoc.getPage(pgIdx);
     const pgSize = pg.getSize();
 
     for (const a of annots) {
@@ -495,51 +523,75 @@ async function exportPDF() {
         const pdfX = a.data.x / renderScale;
         const pdfY = pgSize.height - (a.data.y / renderScale) - a.data.fontSize;
 
-        // Parse hex color
         const c = hexToRgb(a.data.color);
-        pg.drawText(a.data.text, {
-          x: pdfX,
-          y: pdfY,
-          size: a.data.fontSize,
-          font,
-          color: rgb(c.r / 255, c.g / 255, c.b / 255),
+        const lines = a.data.text.split('\n');
+        lines.forEach((line, i) => {
+          pg.drawText(line, {
+            x: pdfX,
+            y: pdfY - i * a.data.fontSize * 1.2,
+            size: a.data.fontSize,
+            font,
+            color: rgb(c.r / 255, c.g / 255, c.b / 255),
+          });
         });
       }
       if (a.type === 'draw' || a.type === 'highlight') {
-        // Draw paths as lines on the page
         const pts = a.data.points;
         if (pts.length < 2) continue;
-        const c = hexToRgb(a.data.color);
+        // [FIX #5] 正确处理 rgba 颜色
+        const c = colorToRgb(a.data.color);
         const color = rgb(c.r / 255, c.g / 255, c.b / 255);
+        const opacity = a.type === 'highlight' ? 0.3 : 1;
 
-        // pdf-lib doesn't have a great free-draw, so we draw line segments
         for (let i = 1; i < pts.length; i++) {
           pg.drawLine({
-            start: { x: pts[i-1].x / renderScale, y: pgSize.height - pts[i-1].y / renderScale },
+            start: { x: pts[i - 1].x / renderScale, y: pgSize.height - pts[i - 1].y / renderScale },
             end: { x: pts[i].x / renderScale, y: pgSize.height - pts[i].y / renderScale },
             thickness: a.data.size / renderScale,
             color,
-            opacity: a.type === 'highlight' ? 0.3 : 1,
+            opacity,
           });
         }
       }
     }
   }
 
-  const bytes = await state.pdfLibDoc.save();
-  download(bytes, $('fileName').textContent.replace('.pdf', '_edited.pdf'));
+  const bytes = await exportDoc.save();
+  const origName = $('fileName').textContent;
+  const exportName = origName.replace(/\.pdf$/i, '') + '_edited.pdf';
+  download(bytes, exportName);
 
-  // Reload to keep state consistent (annotations are now baked)
+  // Clear annotations since they're baked into the exported file
   state.annotations = {};
+  state.undoStack = [];
+  state.redoStack = [];
+}
+
+// [FIX #5] 支持解析 rgba() 和 hex 两种颜色格式
+function colorToRgb(colorStr) {
+  // Try hex first
+  const hex = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(colorStr);
+  if (hex) {
+    return {
+      r: parseInt(hex[1], 16),
+      g: parseInt(hex[2], 16),
+      b: parseInt(hex[3], 16),
+    };
+  }
+  // Try rgba(r,g,b,a)
+  const rgba = /rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/.exec(colorStr);
+  if (rgba) {
+    return {
+      r: parseInt(rgba[1]),
+      g: parseInt(rgba[2]),
+      b: parseInt(rgba[3]),
+    };
+  }
+  return { r: 0, g: 0, b: 0 };
 }
 
 function hexToRgb(hex) {
-  const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
-  return result ? {
-    r: parseInt(result[1], 16),
-    g: parseInt(result[2], 16),
-    b: parseInt(result[3], 16),
-  } : { r: 0, g: 0, b: 0 };
+  return colorToRgb(hex);
 }
 
 function download(bytes, filename) {
@@ -639,6 +691,7 @@ function init() {
   });
   $('btnUndo').addEventListener('click', undo);
   $('btnRedo').addEventListener('click', redo);
+  $('btnSplit').addEventListener('click', () => $('splitModal').classList.remove('hidden'));
   $('btnExport').addEventListener('click', exportPDF);
 }
 
